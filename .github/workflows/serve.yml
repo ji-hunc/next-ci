@@ -1,0 +1,105 @@
+name: Serve Next on CI
+
+# 수동 실행(원할 때 버튼으로) + main push 시 실행
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "서버를 몇 분 동안 살려둘지 (최대 350, GitHub job 6h 제한)"
+        required: false
+        default: "30"
+  push:
+    branches: [main]
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    # job이 서버를 띄운 채 살아있어야 하므로 타임아웃을 넉넉히.
+    # (GitHub-hosted runner의 하드 리밋은 6시간 = 360분)
+    timeout-minutes: 355
+
+    env:
+      SERVED_FROM: github-actions
+      PORT: "3000"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # next start는 빌드 산출물이 필요해서 build를 먼저 함.
+      # (dev 서버로 띄우고 싶으면 이 스텝을 지우고 아래 start를 `pnpm dev`로 바꾸면 됩니다.)
+      - name: Build
+        run: pnpm build
+
+      - name: Install cloudflared (터널)
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start Next server (background)
+        run: |
+          pnpm start > next.log 2>&1 &
+          echo "NEXT_PID=$!" >> "$GITHUB_ENV"
+          # 서버가 실제로 뜰 때까지 헬스체크 폴링
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:3000/api/health >/dev/null; then
+              echo "✅ Next up"; break
+            fi
+            sleep 2
+          done
+          curl -s http://localhost:3000/api/health || (cat next.log; exit 1)
+
+      - name: Open public tunnel
+        run: |
+          # 가입 없이 즉석 URL을 주는 cloudflared quick tunnel
+          cloudflared tunnel --url http://localhost:3000 --no-autoupdate \
+            > tunnel.log 2>&1 &
+          echo "TUNNEL_PID=$!" >> "$GITHUB_ENV"
+
+          # 로그에서 공개 URL 추출
+          URL=""
+          for i in $(seq 1 30); do
+            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            echo "❌ 터널 URL을 못 찾음"; cat tunnel.log; exit 1
+          fi
+
+          echo "🌍 Public URL: $URL"
+          {
+            echo "## 🌍 외부 접속 주소"
+            echo ""
+            echo "\`$URL\`"
+            echo ""
+            echo "- 헬스체크: \`$URL/api/health\`"
+            echo "- 이 URL은 job이 살아있는 동안만 유효합니다."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep server alive
+        run: |
+          MIN="${{ github.event.inputs.minutes || '30' }}"
+          echo "⏳ ${MIN}분 동안 서버 유지 (Actions 로그에서 취소하면 즉시 종료)"
+          END=$(( $(date +%s) + MIN * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if ! kill -0 "$NEXT_PID" 2>/dev/null; then
+              echo "❌ Next 프로세스 죽음"; cat next.log; exit 1
+            fi
+            sleep 15
+          done
+          echo "🛑 유지 시간 종료, 정리."
